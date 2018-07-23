@@ -1,4 +1,43 @@
+from __future__ import absolute_import
+from __future__ import division
+
 import tensorflow as tf
+import numpy as np
+from six.moves import range
+
+"""
+
+Overwrites the nil_slot (first row) of the input Tensor with zeros.
+
+The nil_slot is a dummy slot and should not be trained and influence
+the training algorithm.
+
+"""
+def zero_nil_slot(t, name=None):
+    with tf.op_scope([t], name, "zero_nil_slot") as name:
+        t = tf.convert_to_tensor(t, name="t")
+        s = tf.shape(t)[1]
+        z = tf.zeros(tf.stack([1, s]))
+        # z = tf.zeros([1, s])
+        return tf.concat([z, tf.slice(t, [1, 0], [-1, -1])], 0, name=name)
+
+"""
+
+Adds gradient noise as described in http://arxiv.org/abs/1511.06807 [2].
+
+The input Tensor `t` should be a gradient.
+
+The output will be `t` + gaussian noise.
+
+0.001 was said to be a good fixed value for memory networks [2].
+
+"""
+def add_gradient_noise(t, stddev=1e-3, name=None):
+    with tf.op_scope([t, stddev], name, "add_gradient_noise") as name:
+        t = tf.convert_to_tensor(t, name="t")
+        gn = tf.random_normal(tf.shape(t), stddev=stddev)
+        return tf.add(t, gn, name=name)
+
 
 class MemN2NDialog(object):
 
@@ -35,6 +74,34 @@ class MemN2NDialog(object):
         cross_entropy_mean = tf.reduce_mean(cross_entropy, name="cross_entropy_mean")
 
         loss_op = cross_entropy_mean
+
+        # gradient pipeline
+        grads_and_vars = self._opt.compute_gradients(loss_op)
+
+        nil_grads_and_vars = []
+        for g, v in grads_and_vars:
+            if v.name in self._nil_vars:
+                nil_grads_and_vars.append((zero_nil_slot(g), v))
+            else:
+                nil_grads_and_vars.append((g, v))
+        train_op = self._opt.apply_gradients(nil_grads_and_vars, name="train_op")
+
+        # predict_ops
+        predict_op = tf.argmax(logits, 1, name="predict_op")
+        predict_proba_op = tf.nn.softmax(logits, name="predict_proba_op")
+        predict_log_proba_op = tf.log(predict_proba_op, name="predict_log_proba_op")
+
+        # assign ops
+        self.loss_op = loss_op
+        self.predict_op = predict_op
+        self.predict_proba_op = predict_proba_op
+        self.predict_log_proba_op = predict_log_proba_op
+        self.train_op = train_op
+
+        init_op = tf.global_variables_initializer()
+        self._sess = session
+        self._sess.run(init_op)
+        self.saver = tf.train.Saver(max_to_keep=1)
     
     def _build_inputs(self):
         self._stories = tf.placeholder(tf.int32, [None, None, self._sentence_size], name="stories")
@@ -51,11 +118,15 @@ class MemN2NDialog(object):
             self.W = tf.Variable(W, name="W")
         self._nil_vars = set([self.A.name, self.W.name])
 
+    """
+    hop의 개수대로 반복하여 공식에 반영한다
+    """
     def _inference(self, stories, queries):
         with tf.variable_scope(self._name):
             q_emb = tf.nn.embedding_lookup(self.A, queries)
             u_0 = tf.reduce_sum(q_emb, 1)
             u = [u_0]
+            
             for _ in range(self._hops):
                 m_emb = tf.nn.embedding_lookup(self.A, stories)
                 m = tf.reduce_sum(m_emb, 2)
@@ -68,7 +139,8 @@ class MemN2NDialog(object):
                 probs_temp = tf.transpose(tf.expand_dims(probs, -1), [0, 2, 1])
                 c_temp = tf.transpose(m, [0, 2, 1])
                 o_k = tf.reduce_sum(c_temp * probs_temp, 2)
-
+                
+                # 스토리를 반영한 updated question - u^k+1 = u^k + o^k
                 u_k = tf.matmul(u[-1], self.H) + o_k
                 # u_k=u[-1]+tf.matmul(o_k,self.H)
                 # nonlinearity
@@ -79,3 +151,40 @@ class MemN2NDialog(object):
             candidates_emb=tf.nn.embedding_lookup(self.W, self._candidates)
             candidates_emb_sum=tf.reduce_sum(candidates_emb,1)
             return tf.matmul(u_k,tf.transpose(candidates_emb_sum))
+
+    """
+    
+    Runs the training algorithm over the passed batch
+    
+    Args:
+        stories: Tensor (None, memory_size, sentence_size)
+        queries: Tensor (None, sentence_size)
+        answers: Tensor (None, vocab_size)
+    
+    Returns:
+        loss: floating-point number, the loss computed for the batch
+    
+    """
+    def batch_fit(self, stories, queris, answers):
+        feed_dict = {self._stories: stories, 
+                    self._queries: queris, 
+                    self._answers: answers}
+        loss, _ = self._sess.run([self.loss_op, self.train_op], feed_dict=feed_dict)
+        return loss
+
+    """
+    
+    Predicts answers as one-hot encoding.
+    
+    Args:
+        stories: Tensor (None, memory_size, sentence_size)
+        queries: Tensor (None, sentence_size)
+    
+    Returns:
+        answers: Tensor (None, vocab_size)
+    
+    """
+    def predict(self, stories, queries):
+        feed_dict = {self._stories: stories,
+                    self._queries: queries}
+        return self._sess.run(self.predict_op, feed_dict=feed_dict)
