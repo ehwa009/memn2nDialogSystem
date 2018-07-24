@@ -31,7 +31,35 @@ class InteractiveSession():
         self.model = model
 
     def reply(self, msg):
-        pass
+        line = msg.strip().lower()
+        if line == 'clear':
+            self.context = []
+            self.nid = 1
+            reply_msg = 'memory cleared.'
+        else:
+            u = data_utils.tokenize(line)
+            data = [(self.context, u, -1)]
+            s, q, a = data_utils.vectorize_data(data,
+                                self.w2idx,
+                                self.model._sentence_size,
+                                1,
+                                self.n_cand,
+                                self.memory_size)
+            preds = self.model.predict(s,q)
+            r = self.idx2candid[preds[0]]
+            reply_msg = r
+
+            u.append('$u')
+            u.append('#'+str(self.nid))
+            r.append('$r')
+            r.append('#'+str(self.nid))
+
+            self.context.append(u)
+            self.context.append(r)
+
+            self.nid += 1
+        
+        return reply_msg
 
 def parse_args(args):
     parser = argparse.ArgumentParser(
@@ -176,6 +204,21 @@ def main(args):
                         global_step=i)
         
         log_handle.close()
+    # inference
+    else:
+        # restore checkpoint
+        ckpt = tf.train.get_checkpoint_state(CKPT_DIR + str(args['task_id']))
+        if ckpt and ckpt.model_checkpoint_path:
+            print('\n>> restoring checkpoint from', ckpt.model_checkpoint_path)
+            model.saver.restore(model._sess, ckpt.model_checkpoint_path)
+
+        isess = InteractiveSession(model, idx2candid, w2idx, n_cand, memory_size)
+
+        if args['infer']:
+            query = ''
+            while query != 'exit':
+                query = input('>> ')
+                print('>> ' + isess.reply(query))
                 
 
 '''
@@ -198,4 +241,4 @@ def batch_predict(model, S,Q,n, batch_size):
 
 if __name__ == '__main__':
     # main(sys.args[1:])
-    main(['--train', '--task_id=1'])
+    main(['--infer', '--task_id=1'])
